@@ -98,6 +98,37 @@ def main() -> None:
     print("\n7. Replay of request demo-e2 (originally recorded under v1):")
     print(json.dumps(replayed["result"], indent=2, ensure_ascii=False))
 
+    # 7. Multi-signer quorum: v3 requires 2 distinct signers for images.
+    policy.create_version(ADMIN, [PolicyRule(
+        id="signed-images", action=Decision.PASS,
+        match_types=("container-image",), min_signatures=2,
+        roles_allowed=("deployer",))],
+        comment="require two distinct signers", request_id="demo-p3")
+    artifact2 = ("sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+                 "container-image")
+    # ci-bot re-signs with the rotated (currently active) key; qa-bot signs
+    # with its own key. One signer alone is not enough.
+    new_key = rotated["active_key"]["key_id"]
+    keys.grant_signer(ADMIN, new_key, "ci-bot")
+    ci_new = Caller(id="ci-bot", roles=("signer", "deployer"),
+                    key_grants=(new_key,))
+    keys.generate(ADMIN, key_id="k2", ttl=None)
+    keys.grant_signer(ADMIN, "k2", "qa-bot")
+    qa = Caller(id="qa-bot", roles=("signer",), key_grants=("k2",))
+
+    signing.sign_artifact(ci_new, artifact_digest=artifact2[0],
+                          artifact_type=artifact2[1], key_id=new_key,
+                          request_id="demo-s2", signature_ttl=None)
+    show("8. Quorum 2, only one signer", admission.evaluate(
+        CI, artifact_digest=artifact2[0], artifact_type=artifact2[1],
+        request_id="demo-e5"))
+    signing.sign_artifact(qa, artifact_digest=artifact2[0],
+                          artifact_type=artifact2[1], key_id="k2",
+                          request_id="demo-s3", signature_ttl=None)
+    show("9. Quorum 2, two distinct signers", admission.evaluate(
+        CI, artifact_digest=artifact2[0], artifact_type=artifact2[1],
+        request_id="demo-e6"))
+
     print(f"\n# audit events persisted: {len(store.read_audit())} in {data_dir}/audit.log")
 
 

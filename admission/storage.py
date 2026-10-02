@@ -28,7 +28,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from admission.replay import apply_events, rebuild_state
+from admission.replay import STATE_FORMAT, apply_events, rebuild_state
 
 STATE_FILE = "state.json"
 AUDIT_FILE = "audit.log"
@@ -62,7 +62,9 @@ class Store:
                 snapshot = json.loads(self._state_path.read_text("utf-8"))
         except (json.JSONDecodeError, OSError):
             snapshot = None
-        if snapshot is None or int(snapshot.get("last_seq", 0)) < log_seq:
+        if (snapshot is None
+                or snapshot.get("format") != STATE_FORMAT
+                or int(snapshot.get("last_seq", 0)) < log_seq):
             state = rebuild_state(events)
             self._write_state_atomic(state)
             return state

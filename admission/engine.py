@@ -12,7 +12,9 @@ Fixed decision order (the first failing gate decides ``reason``):
 2. a policy version must exist and contain a rule matching the artifact type
    (otherwise ``policy_not_covered`` -> manual review)
 3. the caller must hold a role allowed by the matched rule
-4. if the rule requires a signature, the signature must be ``valid``
+4. if the rule requires signatures (``require_signature`` or
+   ``min_signatures``), enough *distinct* signers must hold currently-valid
+   signatures: the same signer or the same key never counts twice
 5. the rule action gives pass / deny / manual_review
 """
 from __future__ import annotations
@@ -46,23 +48,72 @@ def select_rule(policy: PolicyVersion | None, artifact_type: str) -> PolicyRule 
     return None
 
 
+def account_quorum(signatures: list[dict], required: int) -> dict:
+    """Count distinct currently-valid signers towards ``required``.
+
+    A signature counts only when it is ``valid`` *and* neither its signer nor
+    its key has already counted — the same person or the same key can never
+    fill two seats. Every registered signature that does not count is listed
+    under ``rejected`` with the reason (its invalid status, or the duplicate
+    contributor it collides with). Input order must be deterministic (the
+    signing service sorts), which makes the accounting deterministic.
+    """
+    counted_signers: list[str] = []
+    counted_keys: list[str] = []
+    rejected: list[dict] = []
+    for entry in signatures:
+        sig = entry["signature"]
+        signer, key_id = sig["signed_by"], sig["key_id"]
+        if entry["status"] != "valid":
+            rejected.append({"signed_by": signer, "key_id": key_id,
+                             "status": entry["status"], "reason": entry["reason"]})
+        elif signer in counted_signers:
+            rejected.append({"signed_by": signer, "key_id": key_id,
+                             "status": "duplicate_signer",
+                             "reason": "signature_duplicate_signer"})
+        elif key_id in counted_keys:
+            rejected.append({"signed_by": signer, "key_id": key_id,
+                             "status": "duplicate_key",
+                             "reason": "signature_duplicate_key"})
+        else:
+            counted_signers.append(signer)
+            counted_keys.append(key_id)
+    counted = len(counted_signers)
+    return {
+        "required": required,
+        "counted": counted,
+        "missing": max(0, required - counted),
+        "counted_signers": counted_signers,
+        "counted_keys": counted_keys,
+        "rejected": rejected,
+    }
+
+
 def evaluate(
     *,
     caller: Caller | None,
     artifact: ArtifactManifest,
     policy: PolicyVersion | None,
-    signature: dict | None,
-    signature_status: str | None,
-    signature_reason: str | None,
+    signatures: list[dict],
     evaluated_at: str,
     request_id: str,
 ) -> EvaluationResult:
+    # Representative signature for the legacy single-signature fields: the
+    # first valid one if any, else the first registered, else nothing.
+    representative = next((e for e in signatures if e["status"] == "valid"),
+                          signatures[0] if signatures else None)
+    signature = representative["signature"] if representative else None
+    signature_status = representative["status"] if representative else "missing"
+    signature_reason = representative["reason"] if representative \
+        else DenyReason.SIGNATURE_MISSING.value
+
     basis: list[str] = [
         f"request_id={request_id}",
         f"evaluated_at={evaluated_at}",
         f"artifact={artifact.digest} type={artifact.artifact_type}",
         f"policy_version={policy.version if policy else 0}",
     ]
+    quorum: dict | None = None
 
     def result(decision: Decision, reason: str, rule: PolicyRule | None,
                rationale: str) -> EvaluationResult:
@@ -79,6 +130,7 @@ def evaluate(
             signature_status=signature_status,
             rationale=rationale,
             basis=basis,
+            signature_quorum=quorum,
         )
         logger.info(
             "admission input=%s decision=%s reason=%s basis=%s",
@@ -89,6 +141,8 @@ def evaluate(
                     "artifact": artifact.digest,
                     "policy_version": res.policy_version,
                     "signature_status": signature_status,
+                    "quorum": (f"{quorum['counted']}/{quorum['required']}"
+                               if quorum else "n/a"),
                 }.items()
             ),
             decision.value, reason, basis,
@@ -126,20 +180,45 @@ def evaluate(
     basis.append(
         f"gate3: role check passed ({list(rule.roles_allowed) or 'any authenticated'})")
 
-    # Gate 4: signature
-    basis.append(f"gate4: signature_required={rule.require_signature} "
-                 f"status={signature_status or 'n/a'}")
-    if rule.require_signature:
-        if signature_status != "valid":
+    # Gate 4: signature quorum
+    required = rule.required_signatures
+    if required > 0:
+        quorum = account_quorum(signatures, required)
+        basis.append(
+            f"gate4: signatures required={required} "
+            f"counted={quorum['counted']} missing={quorum['missing']} "
+            f"registered={len(signatures)}")
+        for rej in quorum["rejected"]:
+            basis.append(
+                f"gate4: not counted {rej['signed_by']}#{rej['key_id']} "
+                f"-> {rej['status']}")
+        if not signatures:
             return result(
-                Decision.DENY,
-                signature_reason or DenyReason.SIGNATURE_MISSING.value,
-                rule,
-                f"rule '{rule.id}' requires a valid signature; status is "
-                f"'{signature_status or 'missing'}'",
+                Decision.DENY, DenyReason.SIGNATURE_MISSING.value, rule,
+                f"rule '{rule.id}' requires a valid signature "
+                f"({required} distinct valid signer(s)); none is registered "
+                f"for this artifact",
             )
-    elif signature_status is not None:
-        basis.append(f"gate4: signature not required; observed status '{signature_status}'")
+        if quorum["counted"] < required:
+            # Legacy single-signature rules keep their specific per-signature
+            # reason (expired/revoked/...); multi-signature rules report the
+            # quorum shortfall as its own distinguishable reason.
+            reason = (signature_reason if required == 1
+                      else DenyReason.SIGNATURE_QUORUM_NOT_MET.value)
+            return result(
+                Decision.DENY, reason, rule,
+                f"rule '{rule.id}' requires {required} distinct valid "
+                f"signer(s); only {quorum['counted']} count "
+                f"(missing {quorum['missing']})",
+            )
+    elif rule.require_signature:
+        # Unreachable: require_signature implies required >= 1.
+        raise AssertionError("require_signature must yield required >= 1")
+    elif signatures:
+        basis.append(f"gate4: signature not required; observed status "
+                     f"'{signature_status}'")
+    else:
+        basis.append("gate4: signature not required; none registered")
 
     # Gate 5: action
     if rule.action is Decision.PASS:
@@ -200,16 +279,14 @@ class AdmissionService:
                 raise AssertionError("index points to missing evaluation event")
 
             policy = self._load_policy(policy_version)
-            signature, sig_status, sig_reason = self.signing.validate_signature(
+            signatures = self.signing.validate_signatures(
                 artifact_digest, artifact_type)
             evaluated_at = utcnow_str(self.clock)
             res = evaluate(
                 caller=caller,
                 artifact=artifact,
                 policy=policy,
-                signature=signature,
-                signature_status=sig_status,
-                signature_reason=sig_reason,
+                signatures=signatures,
                 evaluated_at=evaluated_at,
                 request_id=request_id,
             )

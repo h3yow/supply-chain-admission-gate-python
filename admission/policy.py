@@ -181,4 +181,8 @@ class PolicyService:
                 raise ValueError(f"rule '{rule.id}' has invalid action {rule.action!r}")
             if rule.id in seen:
                 raise ValueError(f"duplicate rule id '{rule.id}'")
+            if rule.min_signatures < 0:
+                raise ValueError(
+                    f"rule '{rule.id}' has negative min_signatures "
+                    f"{rule.min_signatures}")
             seen.add(rule.id)

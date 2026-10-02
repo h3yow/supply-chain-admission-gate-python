@@ -2,7 +2,7 @@
 
 一个完全本地可运行的供应链准入网关：用本地 JSON 存储模拟制品/签名/策略数据，用本地随机
 密钥 + HMAC-SHA256 模拟签名体系。所有准入结论 **确定、可解释、可追溯**，支持密钥轮换、
-签名时效、策略版本回退、并发幂等提交与崩溃恢复。
+签名时效、**多人签名门槛（quorum）**、策略版本回退、并发幂等提交与崩溃恢复。
 
 - 框架：FastAPI（`uv run uvicorn main:app`）
 - 存储：数据目录下的追加式审计日志 `audit.log`（事实源）+ 原子快照 `state.json`
@@ -14,7 +14,7 @@
 
 ```bash
 uv sync                                  # 安装依赖
-uv run pytest -q                         # 运行全部 26 个测试（含并发/跨进程/回退/恢复）
+uv run pytest -q                         # 运行全部 37 个测试（含多签/并发/跨进程/回退/恢复）
 uv run python demo.py                    # 不启服务，直接走一遍完整故事线
 uv run uvicorn main:app --reload         # 启动 HTTP 服务，默认 http://127.0.0.1:8000/docs
 ```
@@ -78,6 +78,10 @@ curl -s "$BASE/admission/replay/e2"
 
 - 策略由有序的 `PolicyRule` 列表构成；评估时 **第一个匹配制品类型的规则生效**
   （`match_types` 为空元组表示匹配所有类型）。
+- 每条规则的签名字段二选一或叠加：
+  - `require_signature: true` —— 旧语义：至少 **1** 个当前有效的签名；
+  - `min_signatures: N`（N>0）—— 多签门槛：至少 **N 个不同签名方** 各持当前有效签名
+    （隐含 require_signature；详见 §3.3）。
 - 每次变更都产生 **不可变新版本**，版本号严格递增；回退不是改写旧版本，而是
   **追加一个规则集等于目标版本的新版本**，因此任何历史版本永不丢失、可随时复现。
 - 创建策略时可传 `expected_version` 做乐观并发控制：当前版本不匹配则返回
@@ -92,7 +96,7 @@ curl -s "$BASE/admission/replay/e2"
 | 1 | 调用方身份必须存在 | `deny` | `identity_unknown` |
 | 2 | 策略存在且有规则覆盖该制品类型 | `manual_review` | `policy_not_covered` |
 | 3 | 调用方具备规则要求的角色 | `deny` | `permission_denied` |
-| 4 | 若规则 `require_signature`，签名状态须为 `valid` | `deny` | 见 §3.2 的签名原因 |
+| 4 | 若规则要求签名，有效签名的不同签名方数量须达到门槛 | `deny` | 见 §3.2/§3.3 的签名原因 |
 | 5 | 规则动作 | `pass` / `deny` / `manual_review` | `ok` / `policy_explicit_deny` / `ok` |
 
 三类"不通过"被刻意区分：
@@ -103,6 +107,21 @@ curl -s "$BASE/admission/replay/e2"
 
 每个结论都携带：`decision`、`reason`、`policy_version`、`rule_id`、`evaluated_at`、
 调用方与制品摘要、签名状态、人类可读 `rationale` 以及分级判定依据数组 `basis`。
+当匹配的规则要求签名时，结论还携带 `signature_quorum` 账本：
+
+```json
+"signature_quorum": {
+  "required": 2,            // 门槛：需要几个不同签名方
+  "counted": 1,             // 实际算数的有效签名方数量
+  "missing": 1,             // 还差几个
+  "counted_signers": ["alice"],
+  "counted_keys": ["k-alice"],
+  "rejected": [             // 每条没算数的签名及原因
+    {"signed_by": "bob", "key_id": "k-bob",
+     "status": "expired", "reason": "signature_expired"}
+  ]
+}
+```
 
 ### 2.3 稳定性承诺
 
@@ -148,8 +167,46 @@ curl -s "$BASE/admission/replay/e2"
 - 吊销立即且追溯生效；授权被撤销同样会让既有签名变为 `unauthorized_caller`，重新授权后
   无需重签即可恢复。
 - 签名登记接口幂等：相同 `request_id` 重试返回同一记录（审计记 `signature_dedup_hit`）；
-- 不同 `request_id` 对同一制品重复签名返回 `409 idempotency_conflict`，
-  从根上杜绝同一制品出现互相矛盾的多条签名。
+  同一签名方用同一把密钥对同一制品的重复/并发提交（即使换了 `request_id`）也返回原记录，
+  不会重复计数，也不会报错；不同签名方或不同密钥的签名则各自独立登记（见 §3.3）。
+
+### 3.3 多人签名（quorum）模型
+
+**登记模型**：一个制品可登记多条签名，每条签名的去重身份是
+`(制品 digest, 签名方, 密钥)` 三元组（内部称为 slot）：
+
+- 同一签名方 + 同一密钥 + 同一制品：无论重试、重复提交还是并发抢跑，都只算一份，
+  返回首次登记的原记录（`dedup: true`），审计记 `signature_dedup_hit`；
+- 同一签名方换一把密钥（如轮换后补签）、或不同签名方：各自登记为独立签名，
+  历史签名全部保留可查（`GET /signatures/{digest}` 返回该制品的全部签名）。
+
+**门槛判定**：规则 `min_signatures: N` 要求至少 N 个 **不同签名方** 持有当前有效签名。
+计数的签名必须同时满足：签名本身状态为 `valid`（见 §3.2，含密钥未吊销、签名方授权仍有效）、
+且其签名方与密钥都没有已经计过数——同一个人或同一把钥匙永远不能占两个席位。
+没算数的签名逐条列入结论的 `signature_quorum.rejected` 并给出原因
+（`expired` / `revoked` / `unauthorized_caller` / `duplicate_signer` / `duplicate_key` 等）。
+
+**结论区分**：
+
+- 一条签名都没有 → `deny / signature_missing`；
+- 有签名但算数的不同签名方不够 N → `deny / signature_quorum_not_met`
+  （`required`/`counted`/`missing` 在 `signature_quorum` 中可见）；
+- 旧规则 `require_signature: true`（等价门槛 1）保持原语义：签名存在但无效时仍返回
+  该签名的具体原因（如 `signature_expired`），而不是 quorum 错误码。
+
+**密钥轮换/吊销与补签**：
+
+- 轮换本身不使轮换前的旧签名失效（§3.2 既有语义）；吊销密钥或撤销签名方授权则
+  **追溯生效**，相关签名立即不再算数，门槛可能因此跌破——结论变为
+  `signature_quorum_not_met` 并在 `rejected` 中说明；
+- 此时可用 **当前活跃密钥** 对同一制品补签（新密钥 = 新 slot，不与历史签名冲突），
+  把门槛重新凑齐；历史签名保留可查，已持久化的历史结论（按 `request_id` 重放）
+  也永不被新事实改写，不会出现同一制品前后结论自相矛盾。
+
+**本地验证**：`uv run python demo.py` 的第 8–9 步演示 quorum=2 下"差一票"与"凑齐两人"
+两种结论；`uv run pytest tests/test_multisig.py -q` 运行多签专项用例（评估日志含输入摘要
+与 `quorum=counted/required` 计数，可用 `pytest -o log_cli=true` 直观看到）。旧版
+`state.json`（单签布局）在启动时自动从 `audit.log` 重建为多签布局，无需手工迁移。
 
 ---
 
@@ -189,8 +246,8 @@ curl -s "$BASE/admission/replay/e2"
 | POST | `/admin/keys/{id}/revoke` | 吊销密钥 |
 | POST | `/admin/keys/{id}/grants` | 授权签名方 |
 | DELETE | `/admin/keys/{id}/grants/{caller}` | 撤销授权 |
-| POST | `/signatures` | 幂等登记制品签名 |
-| GET | `/signatures/{digest}` | 查询签名 |
+| POST | `/signatures` | 幂等登记制品签名（同一制品可有多签名方） |
+| GET | `/signatures/{digest}` | 查询该制品登记的全部签名 |
 | POST | `/admin/policies` | 创建策略版本（支持乐观锁） |
 | POST | `/admin/policies/rollback` | 回退到历史版本（追加新版本） |
 | GET | `/admin/policies` / `/admin/policies/{v}` | 版本列表 / 指定版本 |
@@ -214,11 +271,12 @@ admission/
   storage.py   文件锁、原子写、事务、快照与日志读写
   replay.py    审计事件 -> 状态快照的折叠（崩溃恢复事实依据）
   keys.py      密钥生成/轮换/吊销/授权
-  signing.py   幂等签名登记与七态签名校验
-  policy.py    策略版本、乐观锁、回退
-  engine.py    纯判定函数 + 评估编排（幂等/重放/审计）
+  signing.py   幂等多签登记（slot 去重）与七态签名校验
+  policy.py    策略版本、签名门槛、乐观锁、回退
+  engine.py    纯判定函数 + quorum 计数 + 评估编排（幂等/重放/审计）
   audit.py     审计查询
   app.py       FastAPI 路由与错误归类
-tests/         稳定性、轮换/过期、线程与进程并发、回退、崩溃恢复、HTTP 全链路
+tests/         多签门槛/补签/去重、稳定性、轮换/过期、线程与进程并发、回退、
+               崩溃恢复、HTTP 全链路
 demo.py        本地故事线演示（不启服务）
 ```

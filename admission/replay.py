@@ -27,14 +27,27 @@ from admission.audit_event_types import (
     SIGNATURE_REGISTERED,
 )
 
+# State-layout version. Bump when the projection shape changes (e.g. v2:
+# signatures became per-artifact slot maps); snapshots written by an older
+# layout are discarded and rebuilt from the audit log, which is format-stable.
+STATE_FORMAT = 2
+
+
+def signature_slot(sig: dict[str, Any]) -> str:
+    """Dedup identity of a signature: one slot per (signer, key) per artifact."""
+    return f"{sig['signed_by']}#{sig['key_id']}"
+
 
 def empty_state() -> dict[str, Any]:
     return {
+        "format": STATE_FORMAT,
         "last_seq": 0,
         "current_policy_version": 0,
         "keys": {},          # key_id -> key record dict
         "key_grants": {},    # key_id -> [caller_ids] allowed to sign with it
-        "signatures": {},    # artifact_digest -> signature record dict
+        "signatures": {},    # artifact_digest -> {slot -> signature record};
+                             # slot = "<signed_by>#<key_id>" so each signer+key
+                             # pair contributes at most one signature per artifact
         "policies": {},      # version(int as str) -> policy version dict
         "request_index": {}, # request_id -> {"seq": int, "kind": str, "result_key": str}
     }
@@ -75,11 +88,13 @@ def apply_events(state: dict[str, Any], events: list[dict[str, Any]]) -> dict[st
 
         elif kind == SIGNATURE_REGISTERED:
             sig = payload["signature"]
-            state["signatures"][sig["artifact_digest"]] = sig
+            slot = signature_slot(sig)
+            state["signatures"].setdefault(sig["artifact_digest"], {})[slot] = sig
             state["request_index"][request_id] = {
                 "seq": seq,
                 "kind": "sign",
                 "result_key": sig["artifact_digest"],
+                "slot": slot,
             }
 
         elif kind == SIGNATURE_DEDUP_HIT:
@@ -87,6 +102,7 @@ def apply_events(state: dict[str, Any], events: list[dict[str, Any]]) -> dict[st
                 "seq": seq,
                 "kind": "sign_dedup",
                 "result_key": payload["artifact_digest"],
+                "slot": payload["slot"],
             }
 
         elif kind == POLICY_CREATED:

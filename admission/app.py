@@ -91,6 +91,7 @@ class RuleIn(BaseModel):
     match_types: list[str] = Field(default_factory=list)
     require_signature: bool = False
     roles_allowed: list[str] = Field(default_factory=list)
+    min_signatures: int = 0  # >0: distinct valid signers required (implies require_signature)
 
 
 class PolicyIn(BaseModel):
@@ -227,8 +228,8 @@ def create_app() -> FastAPI:
         )
 
     @app.get("/signatures/{artifact_digest:path}")
-    def get_signature(artifact_digest: str):
-        return get_services()["signing"].get_signature(artifact_digest)
+    def get_signatures(artifact_digest: str):
+        return get_services()["signing"].get_signatures(artifact_digest)
 
     # ---------------------------------------------------------- policies
     @app.post("/admin/policies")
@@ -242,7 +243,8 @@ def create_app() -> FastAPI:
             PolicyRule(id=r.id, action=r.action,
                        match_types=tuple(r.match_types),
                        require_signature=r.require_signature,
-                       roles_allowed=tuple(r.roles_allowed))
+                       roles_allowed=tuple(r.roles_allowed),
+                       min_signatures=r.min_signatures)
             for r in body.rules
         ]
         return svc["policy"].create_version(

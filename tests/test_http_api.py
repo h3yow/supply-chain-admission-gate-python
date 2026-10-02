@@ -123,6 +123,64 @@ def test_policy_rotation_and_rollback_over_http(client, actors):
     assert [v["version"] for v in listing] == [1, 2, 3]
 
 
+def test_multi_signature_quorum_over_http(client, actors):
+    # policy: two distinct signers required for container images
+    r = client.post("/admin/keys", json={"key_id": "k1", "ttl_days": None},
+                    headers=actors["admin"])
+    assert r.status_code == 200, r.text
+    r = client.post("/admin/keys", json={"key_id": "k2", "ttl_days": None},
+                    headers=actors["admin"])
+    assert r.status_code == 200, r.text
+    for key_id, signer in (("k1", "ci"), ("k2", "qa")):
+        assert client.post(f"/admin/keys/{key_id}/grants",
+                           json={"signer_id": signer},
+                           headers=actors["admin"]).status_code == 200
+    r = client.post("/admin/policies", headers=actors["admin"], json={
+        "expected_version": 0, "request_id": "p1",
+        "rules": [{"id": "images", "action": "pass",
+                   "match_types": ["container-image"],
+                   "min_signatures": 2,
+                   "roles_allowed": ["deployer"]}]})
+    assert r.status_code == 200, r.text
+
+    qa = {"X-Caller-Id": "qa", "X-Caller-Roles": "signer",
+          "X-Caller-Key-Grants": "k2"}
+
+    # one signature -> quorum not met (distinguishable from missing)
+    r = client.post("/signatures", headers=actors["ci"], json={
+        "artifact_digest": "sha256:m", "artifact_type": "container-image",
+        "key_id": "k1", "request_id": "s1", "ttl_days": None})
+    assert r.status_code == 200 and r.json()["dedup"] is False
+    r = client.post("/admission/evaluate", headers=actors["ci"], json={
+        "artifact_digest": "sha256:m", "artifact_type": "container-image",
+        "request_id": "e1"})
+    body = r.json()
+    assert body["decision"] == "deny"
+    assert body["reason"] == "signature_quorum_not_met"
+    assert body["signature_quorum"]["counted"] == 1
+    assert body["signature_quorum"]["required"] == 2
+
+    # second distinct signer -> pass; GET lists both signatures
+    r = client.post("/signatures", headers=qa, json={
+        "artifact_digest": "sha256:m", "artifact_type": "container-image",
+        "key_id": "k2", "request_id": "s2", "ttl_days": None})
+    assert r.status_code == 200 and r.json()["dedup"] is False
+    r = client.post("/admission/evaluate", headers=actors["ci"], json={
+        "artifact_digest": "sha256:m", "artifact_type": "container-image",
+        "request_id": "e2"})
+    assert r.json()["decision"] == "pass"
+    r = client.get("/signatures/sha256:m")
+    assert r.status_code == 200
+    assert len(r.json()["signatures"]) == 2
+
+    # retry of the first signature -> dedup, still exactly two on record
+    r = client.post("/signatures", headers=actors["ci"], json={
+        "artifact_digest": "sha256:m", "artifact_type": "container-image",
+        "key_id": "k1", "request_id": "s1-retry", "ttl_days": None})
+    assert r.status_code == 200 and r.json()["dedup"] is True
+    assert len(client.get("/signatures/sha256:m").json()["signatures"]) == 2
+
+
 def test_key_rotation_over_http_invalidates_future_use(client, actors):
     _signed_image_world(client, actors)
     r = client.post("/admin/keys/k1/rotate", headers=actors["admin"])
