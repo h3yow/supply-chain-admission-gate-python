@@ -179,6 +179,10 @@ class PolicyService:
         for rule in rules:
             if rule.action not in tuple(Decision):
                 raise ValueError(f"rule '{rule.id}' has invalid action {rule.action!r}")
+            if rule.min_signatures < 1:
+                raise ValueError(
+                    f"rule '{rule.id}' has invalid min_signatures "
+                    f"{rule.min_signatures}; must be >= 1")
             if rule.id in seen:
                 raise ValueError(f"duplicate rule id '{rule.id}'")
             seen.add(rule.id)

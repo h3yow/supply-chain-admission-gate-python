@@ -91,6 +91,7 @@ class RuleIn(BaseModel):
     match_types: list[str] = Field(default_factory=list)
     require_signature: bool = False
     roles_allowed: list[str] = Field(default_factory=list)
+    min_signatures: int = 1
 
 
 class PolicyIn(BaseModel):
@@ -242,7 +243,8 @@ def create_app() -> FastAPI:
             PolicyRule(id=r.id, action=r.action,
                        match_types=tuple(r.match_types),
                        require_signature=r.require_signature,
-                       roles_allowed=tuple(r.roles_allowed))
+                       roles_allowed=tuple(r.roles_allowed),
+                       min_signatures=r.min_signatures)
             for r in body.rules
         ]
         return svc["policy"].create_version(

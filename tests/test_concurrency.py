@@ -67,36 +67,41 @@ def test_concurrent_sign_same_request_id_registers_once(tmp_path):
     assert types.count("signature_dedup_hit") == 15
 
 
-def test_concurrent_sign_distinct_request_ids_same_artifact_one_winner(tmp_path):
+def test_concurrent_sign_same_signer_same_key_dedups_to_one_record(tmp_path):
+    """Same signer + same key + same artifact, distinct request_ids racing:
+    every caller gets the original record back (dedup), exactly one signature
+    is stored and exactly one registration event is emitted."""
     data_dir = str(tmp_path / "data2")
     store = __import__("admission.storage", fromlist=["Store"]).Store(data_dir)
     keys = KeyService(store, FixedClock())
     keys.generate(ADMIN, key_id="k1", ttl=None)
     keys.grant_signer(ADMIN, "k1", "ci")
 
-    outcomes: list[str] = []
+    outcomes: list[dict] = []
     lock = threading.Lock()
 
     def worker(idx):
         _, signing, _ = _fresh_services(data_dir)
-        try:
-            signing.sign_artifact(
-                CI, artifact_digest="sha256:once",
-                artifact_type="container-image", key_id="k1",
-                request_id=f"distinct-{idx}", signature_ttl=None)
-            outcome = "registered"
-        except AdmissionError as exc:
-            outcome = exc.error_code.value
+        record = signing.sign_artifact(
+            CI, artifact_digest="sha256:once",
+            artifact_type="container-image", key_id="k1",
+            request_id=f"distinct-{idx}", signature_ttl=None)
         with lock:
-            outcomes.append(outcome)
+            outcomes.append(record)
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         list(pool.map(worker, range(12)))
 
-    assert outcomes.count("registered") == 1, outcomes
-    assert outcomes.count("idempotency_conflict") == 11
+    assert len(outcomes) == 12
+    # All responses describe the same single signature record.
+    assert len({r["signature"] for r in outcomes}) == 1
+    assert sum(1 for r in outcomes if r["dedup"] is False) == 1
+    assert sum(1 for r in outcomes if r["dedup"] is True) == 11
     store_after, _, _ = _fresh_services(data_dir)
-    assert len(store_after.state["signatures"]) == 1
+    assert len(store_after.state["signatures"]["sha256:once"]) == 1
+    types = [e["event_type"] for e in store_after.read_audit()]
+    assert types.count("signature_registered") == 1
+    assert types.count("signature_dedup_hit") == 11
 
 
 def test_concurrent_evaluations_same_request_id_are_identical(tmp_path):

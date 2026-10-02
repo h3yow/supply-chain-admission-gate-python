@@ -34,10 +34,33 @@ def empty_state() -> dict[str, Any]:
         "current_policy_version": 0,
         "keys": {},          # key_id -> key record dict
         "key_grants": {},    # key_id -> [caller_ids] allowed to sign with it
-        "signatures": {},    # artifact_digest -> signature record dict
+        "signatures": {},    # artifact_digest -> {record_key: signature record}
         "policies": {},      # version(int as str) -> policy version dict
         "request_index": {}, # request_id -> {"seq": int, "kind": str, "result_key": str}
     }
+
+
+def signature_record_key(record: dict[str, Any]) -> str:
+    """Identity of one signature registration: signer + key per artifact.
+
+    The same signing party re-submitting with the same key for the same
+    artifact maps to the same record key, so retries/concurrent duplicates
+    collapse onto one record instead of double-counting.
+    """
+    return f"{record['signed_by']}:{record['key_id']}"
+
+
+def migrate_state(state: dict[str, Any]) -> dict[str, Any]:
+    """Upgrade a pre-multi-signature snapshot in place (idempotent).
+
+    Old snapshots stored ``signatures[digest] = <record>``; the current
+    layout is ``signatures[digest] = {record_key: <record>}``.
+    """
+    signatures = state.get("signatures", {})
+    for digest, value in list(signatures.items()):
+        if isinstance(value, dict) and "signature" in value:
+            signatures[digest] = {signature_record_key(value): value}
+    return state
 
 
 def apply_events(state: dict[str, Any], events: list[dict[str, Any]]) -> dict[str, Any]:
@@ -75,7 +98,8 @@ def apply_events(state: dict[str, Any], events: list[dict[str, Any]]) -> dict[st
 
         elif kind == SIGNATURE_REGISTERED:
             sig = payload["signature"]
-            state["signatures"][sig["artifact_digest"]] = sig
+            per_artifact = state["signatures"].setdefault(sig["artifact_digest"], {})
+            per_artifact[signature_record_key(sig)] = sig
             state["request_index"][request_id] = {
                 "seq": seq,
                 "kind": "sign",

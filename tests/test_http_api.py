@@ -151,3 +151,54 @@ def test_key_rotation_over_http_invalidates_future_use(client, actors):
         "artifact_digest": "sha256:z", "artifact_type": "container-image",
         "key_id": new_id, "request_id": "s-new2", "ttl_days": None})
     assert r.status_code == 200
+
+
+def test_multi_signature_quorum_over_http(client, actors):
+    admin = actors["admin"]
+    for key_id, signer in (("k1", "alice"), ("k2", "bob")):
+        assert client.post("/admin/keys", json={"key_id": key_id,
+                                                "ttl_days": None},
+                           headers=admin).status_code == 200
+        assert client.post(f"/admin/keys/{key_id}/grants",
+                           json={"signer_id": signer},
+                           headers=admin).status_code == 200
+    r = client.post("/admin/policies", headers=admin, json={
+        "expected_version": 0, "request_id": "p1",
+        "rules": [{"id": "images", "action": "pass",
+                   "match_types": ["container-image"],
+                   "require_signature": True, "min_signatures": 2,
+                   "roles_allowed": ["deployer"]}]})
+    assert r.status_code == 200, r.text
+
+    alice = {"X-Caller-Id": "alice", "X-Caller-Roles": "signer,deployer",
+             "X-Caller-Key-Grants": "k1"}
+    bob = {"X-Caller-Id": "bob", "X-Caller-Roles": "signer",
+           "X-Caller-Key-Grants": "k2"}
+
+    def evaluate(request_id):
+        return client.post("/admission/evaluate", headers=alice, json={
+            "artifact_digest": "sha256:img9",
+            "artifact_type": "container-image",
+            "request_id": request_id}).json()
+
+    # One signature short of the quorum.
+    assert client.post("/signatures", headers=alice, json={
+        "artifact_digest": "sha256:img9", "artifact_type": "container-image",
+        "key_id": "k1", "request_id": "s-a", "ttl_days": None}
+        ).status_code == 200
+    body = evaluate("e-short")
+    assert body["decision"] == "deny"
+    assert body["reason"] == "signature_quorum_not_met"
+    assert body["signature_report"]["missing"] == 1
+
+    # Second distinct signer fills the quorum.
+    assert client.post("/signatures", headers=bob, json={
+        "artifact_digest": "sha256:img9", "artifact_type": "container-image",
+        "key_id": "k2", "request_id": "s-b", "ttl_days": None}
+        ).status_code == 200
+    assert evaluate("e-full")["decision"] == "pass"
+
+    # Both registrations are queryable per artifact.
+    r = client.get("/signatures/sha256:img9")
+    assert r.status_code == 200
+    assert {s["signed_by"] for s in r.json()["signatures"]} == {"alice", "bob"}

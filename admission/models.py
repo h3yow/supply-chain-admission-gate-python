@@ -31,6 +31,8 @@ class DenyReason(StrEnum):
     SIGNATURE_KEY_ROTATED = "signature_key_rotated"
     SIGNATURE_KEY_REVOKED = "signature_key_revoked"
     SIGNATURE_UNAUTHORIZED_CALLER = "signature_unauthorized_caller"
+    # At least one signature exists but the distinct-signer quorum is not met
+    SIGNATURE_QUORUM_NOT_MET = "signature_quorum_not_met"
 
 
 class ErrorCode(StrEnum):
@@ -157,6 +159,10 @@ class PolicyRule:
 
     match_types selects artifact types (empty tuple = all types).
     require_signature makes a missing/invalid signature a deny.
+    min_signatures is the quorum of *distinct* signing parties whose
+    signatures must all be currently valid; it only applies when
+    require_signature is set. The default of 1 reproduces the original
+    "at least one valid signature" semantics exactly.
     """
 
     id: str
@@ -164,6 +170,7 @@ class PolicyRule:
     match_types: tuple[str, ...] = ()
     require_signature: bool = False
     roles_allowed: tuple[str, ...] = ()  # empty tuple = any authenticated caller
+    min_signatures: int = 1
 
     def matches(self, artifact_type: str) -> bool:
         return not self.match_types or artifact_type in self.match_types
@@ -285,6 +292,10 @@ class EvaluationResult:
     signature_status: str | None
     rationale: str
     basis: list[str]
+    # Multi-signature quorum detail: required/counted/missing plus the
+    # per-signature verdicts. None when the matched rule does not require
+    # signatures at all.
+    signature_report: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -298,6 +309,7 @@ class EvaluationResult:
             "artifact": self.artifact,
             "signature": self.signature,
             "signature_status": self.signature_status,
+            "signature_report": self.signature_report,
             "rationale": self.rationale,
             "basis": self.basis,
         }

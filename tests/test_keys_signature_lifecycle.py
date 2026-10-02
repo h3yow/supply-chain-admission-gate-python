@@ -78,7 +78,7 @@ def test_expired_signature_is_denied_but_valid_before_ttl(services):
     assert r["signature_status"] == "expired"
 
 
-def test_rotation_pre_signature_valid_post_signature_rejected(services):
+def test_rotation_invalidates_old_key_signatures_and_allows_resign(services):
     keys, signing = services["keys"], services["signing"]
     keys.generate(ADMIN, key_id="k1", ttl=None)
     keys.grant_signer(ADMIN, "k1", "ci")
@@ -91,8 +91,13 @@ def test_rotation_pre_signature_valid_post_signature_rejected(services):
     rotated = keys.rotate(ADMIN, "k1", comment="scheduled rotation")
     new_id = rotated["active_key"]["key_id"]
 
-    # Pre-rotation signature is still valid (signed_at < rotated_at).
-    assert signing.validate_signature("sha256:old", "container-image")[1] == "valid"
+    # Rotation retires the key: the old signature no longer counts, but the
+    # record stays queryable for audit.
+    status, reason = signing.validate_signature("sha256:old",
+                                                "container-image")[1:]
+    assert status == "rotated" and reason == "signature_key_rotated"
+    stored = signing.list_signatures("sha256:old")
+    assert len(stored) == 1 and stored[0]["key_id"] == "k1"
 
     # Signing with the old key after rotation is rejected at registration.
     with pytest.raises(AdmissionError) as exc:
@@ -101,9 +106,18 @@ def test_rotation_pre_signature_valid_post_signature_rejected(services):
                               request_id="s-new")
     assert exc.value.error_code is ErrorCode.KEY_ROTATED
 
-    # New key works only after grant; artifact signed with it is valid.
+    # Re-signing the SAME artifact with the active successor key is allowed
+    # (same signer, different key -> a new independent record) and restores
+    # validity; the historical record is kept alongside, not conflicting.
     keys.grant_signer(ADMIN, new_id, "ci")
     ci_new = Caller(id="ci", roles=("signer",), key_grants=(new_id,))
+    signing.sign_artifact(ci_new, artifact_digest="sha256:old",
+                          artifact_type="container-image", key_id=new_id,
+                          request_id="s-old-resign", signature_ttl=None)
+    assert signing.validate_signature("sha256:old", "container-image")[1] == "valid"
+    assert len(signing.list_signatures("sha256:old")) == 2
+
+    # New key works for fresh artifacts too.
     signing.sign_artifact(ci_new, artifact_digest="sha256:new",
                           artifact_type="container-image", key_id=new_id,
                           request_id="s-new2", signature_ttl=None)

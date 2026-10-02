@@ -1,20 +1,37 @@
-"""Artifact signing and signature validity checks.
+"""Artifact signing and multi-signature validity/quorum evaluation.
 
-Signature status (deterministic, given a point in time and the key registry):
+One artifact may carry many independent signatures, each identified by
+``(artifact_digest, signed_by, key_id)``. Re-submission by the same signing
+party with the same key (retry, duplicate or concurrent race) collapses onto
+the original record and returns it with ``dedup=True``; it never creates a
+second record and never counts twice. A *different* signer or a *different*
+key for the same artifact is a new, independent signature.
 
-* ``missing``    -> no signature registered for the artifact
-* ``unauthorized_caller`` -> signer identity was not granted that key
+Per-signature status (deterministic, given a point in time and the key
+registry):
+
+* ``unauthorized_caller`` -> signer identity lost its server-side grant
 * ``invalid``    -> HMAC does not verify (tampered payload or wrong secret)
 * ``revoked``    -> the signing key has been revoked
-* ``rotated``    -> signature was created with a key after it was rotated
-                    (a pre-rotation signature is only ``expired`` if old)
+* ``rotated``    -> the signing key has been rotated away; every signature
+                    made with it stops counting (re-sign with the successor)
 * ``expired``    -> signature TTL elapsed
 * ``valid``      -> all checks pass
 
-Concurrency: registration is idempotent per ``request_id`` and single-flight
-per artifact digest (store lock). Concurrent/retry submissions either all
-receive the same record (same request_id) or one wins while others get a
-stable ``idempotency_conflict`` (different request_id, same artifact).
+Quorum evaluation (``evaluate_signatures``) counts only ``valid`` signatures,
+deduplicated by signing party *and* by key: one party cannot fill the quorum
+alone, and one key cannot either. The aggregate status is:
+
+* ``missing``        -> no signature registered at all
+* ``quorum_not_met`` -> at least one valid signature, but fewer than required
+* ``valid``          -> counted distinct parties >= required
+* otherwise          -> no valid signature; the most severe per-signature
+                        status (fixed priority: invalid, revoked,
+                        unauthorized_caller, rotated, expired)
+
+Concurrency: registration is idempotent per ``request_id`` and per
+``(artifact, signer, key)`` under the store lock, so concurrent/retry
+submissions all observe the same single record.
 """
 from __future__ import annotations
 
@@ -30,6 +47,7 @@ from admission.models import (
     SignatureNotFoundError,
     SignatureRecord,
 )
+from admission.replay import signature_record_key
 from admission.storage import Store
 
 SIGNER_ROLE = "signer"
@@ -42,7 +60,13 @@ STATUS_TO_REASON = {
     "rotated": DenyReason.SIGNATURE_KEY_ROTATED,
     "revoked": DenyReason.SIGNATURE_KEY_REVOKED,
     "unauthorized_caller": DenyReason.SIGNATURE_UNAUTHORIZED_CALLER,
+    "quorum_not_met": DenyReason.SIGNATURE_QUORUM_NOT_MET,
 }
+
+# Fixed severity order used to pick the aggregate status when no signature is
+# valid at all. Deterministic so the same facts always yield the same reason.
+_FAILURE_PRIORITY = ("invalid", "revoked", "unauthorized_caller",
+                     "rotated", "expired")
 
 
 class SigningService:
@@ -50,6 +74,13 @@ class SigningService:
         self.store = store
         self.clock = clock
         self.keys = keys
+
+    # ------------------------------------------------------------ helpers
+    @staticmethod
+    def _find_record(state: dict, artifact_digest: str, key_id: str,
+                     signer_id: str) -> dict | None:
+        per_artifact = state["signatures"].get(artifact_digest, {})
+        return per_artifact.get(f"{signer_id}:{key_id}")
 
     # ------------------------------------------------------------ register
     def sign_artifact(
@@ -77,8 +108,9 @@ class SigningService:
             if existing_idx is not None:
                 if existing_idx["kind"] in ("sign", "sign_dedup"):
                     digest = existing_idx["result_key"]
-                    record = state["signatures"].get(digest)
-                    if record is not None and digest == artifact_digest:
+                    record = self._find_record(state, digest, key_id, caller.id) \
+                        if digest == artifact_digest else None
+                    if record is not None:
                         self.store.emit(state, {
                             "event_type": "signature_dedup_hit",
                             "occurred_at": now,
@@ -93,13 +125,23 @@ class SigningService:
                     details={"request_id": request_id, "existing": existing_idx},
                 )
 
-            # 2) single-flight per artifact: one signature, never contradicted.
-            if artifact_digest in state["signatures"]:
-                raise IdempotencyConflictError(
-                    f"artifact '{artifact_digest}' already has a registered signature; "
-                    "re-sign with the original request_id or rotate the key first",
-                    details={"artifact_digest": artifact_digest},
-                )
+            # 2) signer+key dedup: the same party re-signing the same artifact
+            #    with the same key (retry/concurrent duplicate under a new
+            #    request_id) returns the original record and never counts
+            #    twice. Other signers/keys on the same artifact are unaffected.
+            record = self._find_record(state, artifact_digest, key_id, caller.id)
+            if record is not None:
+                self.store.emit(state, {
+                    "event_type": "signature_dedup_hit",
+                    "occurred_at": now,
+                    "actor": caller.id,
+                    "request_id": request_id,
+                    "payload": {
+                        "artifact_digest": artifact_digest,
+                        "record_key": signature_record_key(record),
+                    },
+                })
+                return SignatureRecord(**record).summary() | {"dedup": True}
 
             # 3) key must exist and be currently active.
             key_data = state["keys"].get(key_id)
@@ -164,64 +206,137 @@ class SigningService:
             return record.summary() | {"dedup": False}
 
     # ------------------------------------------------------------ validate
-    def validate_signature(
-        self, artifact_digest: str, artifact_type: str
-    ) -> tuple[dict | None, str | None, str | None]:
-        """Return ``(signature_summary_or_None, status, deny_reason_or_None)``.
-
-        Pure with respect to current clock + store state. Ordering of checks is
-        fixed so the returned reason is stable and explainable.
-        """
-        now = self.clock.now()
-        record_data = self.store.state["signatures"].get(artifact_digest)
-        if record_data is None:
-            return None, "missing", DenyReason.SIGNATURE_MISSING.value
-
-        record = SignatureRecord(**record_data)
-        summary = record.summary()
-
-        def bad(status: str) -> tuple[dict, str, str]:
-            return summary, status, STATUS_TO_REASON[status].value
-
+    def _check_record(self, record: SignatureRecord, artifact_type: str,
+                      now) -> str:
+        """Status of one signature record against current time and registry."""
         key_data = self.store.state["keys"].get(record.key_id)
         if key_data is None:  # registered key vanished (cannot happen locally)
-            return bad("invalid")
-        key = type("K", (), key_data)  # lightweight attribute view
+            return "invalid"
 
         # Tampering / secret mismatch first: a rotated/revoked key that no
         # longer verifies is fundamentally invalid, not merely stale.
-        if not verify(key.secret,
-                      canonical_payload(artifact_digest, artifact_type),
+        if not verify(key_data["secret"],
+                      canonical_payload(record.artifact_digest, artifact_type),
                       record.signature):
-            return bad("invalid")
+            return "invalid"
 
         # A signer whose grant is later revoked loses signature validity:
         # authorization is re-evaluated against the authoritative registry.
-        if record.signed_by not in self.store.state.get("key_grants", {}).get(record.key_id, []):
-            return bad("unauthorized_caller")
+        if record.signed_by not in self.store.state.get("key_grants", {}).get(
+                record.key_id, []):
+            return "unauthorized_caller"
 
-        if key.revoked_at is not None:
+        if key_data["revoked_at"] is not None:
             # Revocation is immediate and applies retroactively.
-            return bad("revoked")
+            return "revoked"
 
-        if key.rotated_at is not None and parse_ts(record.signed_at) > parse_ts(key.rotated_at):
-            # Signed with the old key strictly *after* rotation happened.
-            # Equality cannot occur post-rotation: such a registration is
-            # rejected under the same serialised transaction that performed
-            # the rotation, so equal timestamps mean the signature committed
-            # first and remains a legitimate pre-rotation signature.
-            return bad("rotated")
+        if key_data["rotated_at"] is not None:
+            # Rotation retires the key: every signature made with it stops
+            # counting, whenever it was created. The record is kept for
+            # audit, and the signer may re-sign with the successor key.
+            return "rotated"
 
         if record.expires_at is not None and now >= parse_ts(record.expires_at):
-            return bad("expired")
+            return "expired"
 
-        return summary, "valid", None
+        return "valid"
 
-    def get_signature(self, artifact_digest: str) -> dict:
-        data = self.store.state["signatures"].get(artifact_digest)
-        if data is None:
+    def evaluate_signatures(self, artifact_digest: str, artifact_type: str,
+                            required: int = 1) -> dict:
+        """Quorum report over every signature registered for the artifact.
+
+        Pure with respect to current clock + store state. Only ``valid``
+        signatures count, deduplicated by signing party and by key: the first
+        valid signature (in deterministic signed_at order) claims its signer
+        and key; later valid signatures reusing either are reported but not
+        counted.
+        """
+        now = self.clock.now()
+        per_artifact = self.store.state["signatures"].get(artifact_digest, {})
+        records = sorted(
+            (SignatureRecord(**data) for data in per_artifact.values()),
+            key=lambda r: (r.signed_at, r.key_id, r.signed_by),
+        )
+
+        entries: list[dict] = []
+        seen_signers: set[str] = set()
+        seen_keys: set[str] = set()
+        counted = 0
+        for record in records:
+            status = self._check_record(record, artifact_type, now)
+            entry = {
+                "signature": record.summary(),
+                "status": status,
+                "reason": None if status == "valid"
+                          else STATUS_TO_REASON[status].value,
+                "counted": False,
+                "not_counted_reason": None,
+            }
+            if status == "valid":
+                if record.signed_by in seen_signers:
+                    entry["not_counted_reason"] = "duplicate_signer"
+                elif record.key_id in seen_keys:
+                    entry["not_counted_reason"] = "duplicate_key"
+                else:
+                    seen_signers.add(record.signed_by)
+                    seen_keys.add(record.key_id)
+                    counted += 1
+                    entry["counted"] = True
+            else:
+                entry["not_counted_reason"] = entry["reason"]
+            entries.append(entry)
+
+        required = max(1, required)
+        if not entries:
+            status, reason = "missing", STATUS_TO_REASON["missing"].value
+        elif counted >= required:
+            status, reason = "valid", None
+        elif counted >= 1:
+            status = "quorum_not_met"
+            reason = STATUS_TO_REASON["quorum_not_met"].value
+        else:
+            status = next(s for s in _FAILURE_PRIORITY
+                          if any(e["status"] == s for e in entries))
+            reason = STATUS_TO_REASON[status].value
+
+        representative = entries[0]["signature"] if entries else None
+        return {
+            "artifact_digest": artifact_digest,
+            "required": required,
+            "counted": counted,
+            "missing": max(0, required - counted),
+            "entries": entries,
+            "signature": representative,
+            "status": status,
+            "reason": reason,
+        }
+
+    def validate_signature(
+        self, artifact_digest: str, artifact_type: str
+    ) -> tuple[dict | None, str | None, str | None]:
+        """Single-signature view kept for callers of the original API.
+
+        Equivalent to ``evaluate_signatures(..., required=1)``: returns
+        ``(representative_signature_or_None, status, deny_reason_or_None)``.
+        """
+        report = self.evaluate_signatures(artifact_digest, artifact_type,
+                                          required=1)
+        return report["signature"], report["status"], report["reason"]
+
+    # -------------------------------------------------------------- query
+    def list_signatures(self, artifact_digest: str) -> list[dict]:
+        per_artifact = self.store.state["signatures"].get(artifact_digest, {})
+        if not per_artifact:
             raise SignatureNotFoundError(
                 f"no signature registered for artifact '{artifact_digest}'",
                 details={"artifact_digest": artifact_digest},
             )
-        return SignatureRecord(**data).summary()
+        records = sorted(
+            (SignatureRecord(**data) for data in per_artifact.values()),
+            key=lambda r: (r.signed_at, r.key_id, r.signed_by),
+        )
+        return [r.summary() for r in records]
+
+    def get_signature(self, artifact_digest: str) -> dict:
+        return {"artifact_digest": artifact_digest,
+                "signatures": self.list_signatures(artifact_digest)}

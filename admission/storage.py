@@ -28,7 +28,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from admission.replay import apply_events, rebuild_state
+from admission.replay import apply_events, migrate_state, rebuild_state
 
 STATE_FILE = "state.json"
 AUDIT_FILE = "audit.log"
@@ -66,7 +66,7 @@ class Store:
             state = rebuild_state(events)
             self._write_state_atomic(state)
             return state
-        return snapshot
+        return migrate_state(snapshot)
 
     def _read_log(self) -> list[dict[str, Any]]:
         if not self._audit_path.exists():

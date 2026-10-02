@@ -76,11 +76,26 @@ def main() -> None:
         CI, artifact_digest=ARTIFACT[0], artifact_type=ARTIFACT[1],
         request_id="demo-e3"))
 
-    # 4. Rotate key; old pre-rotation signature status explained.
+    # 4. Rotate key: signatures made with k1 stop counting; re-sign with the
+    #    successor key to restore validity (multi-signature model keeps both
+    #    records; only the new one counts).
     clock.advance(timedelta(days=-8))
     rotated = keys.rotate(ADMIN, "k1", comment="quarterly rotation")
-    print(f"\n5. rotated k1 -> {rotated['active_key']['key_id']}; "
-          f"pre-rotation signature stays valid")
+    new_id = rotated["active_key"]["key_id"]
+    print(f"\n5. rotated k1 -> {new_id}; "
+          f"signatures made with k1 no longer count")
+    show("5a. Evaluate with retired-key signature", admission.evaluate(
+        CI, artifact_digest=ARTIFACT[0], artifact_type=ARTIFACT[1],
+        request_id="demo-e3b"))
+    keys.grant_signer(ADMIN, new_id, "ci-bot")
+    ci_new = Caller(id="ci-bot", roles=("signer", "deployer"),
+                    key_grants=(new_id,))
+    signing.sign_artifact(ci_new, artifact_digest=ARTIFACT[0],
+                          artifact_type=ARTIFACT[1], key_id=new_id,
+                          request_id="demo-s2", signature_ttl=timedelta(days=7))
+    show("5b. Evaluate after re-signing with successor key",
+         admission.evaluate(ci_new, artifact_digest=ARTIFACT[0],
+                            artifact_type=ARTIFACT[1], request_id="demo-e3c"))
 
     # 5. Policy v2 denies; then roll back to v1.
     policy.create_version(ADMIN, [PolicyRule(
