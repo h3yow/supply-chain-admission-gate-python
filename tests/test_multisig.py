@@ -176,9 +176,9 @@ def test_rejected_signatures_carry_individual_reasons(services):
     assert rejected == {("alice", "expired"), ("bob", "unauthorized_caller")}
 
 
-def test_resign_with_active_key_after_revocation_restores_quorum(services):
-    """Key revoked -> old signature stops counting -> re-sign with a current
-    active key fills the seat again; history stays queryable."""
+def test_resign_with_active_key_after_rotation_restores_quorum(services):
+    """Key rotated -> old signature stops counting -> re-sign with the
+    rotation's successor key fills the seat again; history stays queryable."""
     _quorum_policy(services, 2)
     alice = _signer(services, "alice", "k-alice")
     bob = _signer(services, "bob", "k-bob")
@@ -191,19 +191,22 @@ def test_resign_with_active_key_after_revocation_restores_quorum(services):
                           signature_ttl=None)
     assert _evaluate(services, "e-before")["decision"] == "pass"
 
-    # Rotation alone keeps the pre-rotation signature valid (legacy语义).
+    # Rotation alone invalidates Alice's historical signature: the artifact
+    # must not be admitted on the strength of the old key any more.
     rotated = keys.rotate(ADMIN, "k-alice")
     new_key = rotated["active_key"]["key_id"]
-    assert _evaluate(services, "e-rotated")["decision"] == "pass"
-
-    # Revoking the old key invalidates Alice's historical signature.
-    keys.revoke(ADMIN, "k-alice", reason="suspected compromise")
-    r = _evaluate(services, "e-revoked")
+    r = _evaluate(services, "e-rotated")
     assert r["decision"] == "deny"
     assert r["reason"] == "signature_quorum_not_met"
-    assert r["signature_quorum"]["counted"] == 1
-    assert any(x["status"] == "revoked"
-               for x in r["signature_quorum"]["rejected"])
+    quorum = r["signature_quorum"]
+    assert quorum["required"] == 2 and quorum["counted"] == 1
+    assert quorum["missing"] == 1
+    rotated_entries = [x for x in quorum["rejected"]
+                       if x["status"] == "rotated"]
+    assert len(rotated_entries) == 1
+    assert rotated_entries[0]["signed_by"] == "alice"
+    assert rotated_entries[0]["key_id"] == "k-alice"
+    assert rotated_entries[0]["reason"] == "signature_key_rotated"
 
     # Re-sign with the current active key -> quorum restored.
     keys.grant_signer(ADMIN, new_key, "alice")
@@ -222,9 +225,10 @@ def test_resign_with_active_key_after_revocation_restores_quorum(services):
     assert {s["key_id"] for s in listed} == {"k-alice", "k-bob", new_key}
 
     # The historical conclusion is not contradicted by the new facts.
-    replay = services["admission"].replay("e-revoked")
+    replay = services["admission"].replay("e-rotated")
     assert replay["result"]["decision"] == "deny"
     assert replay["result"]["reason"] == "signature_quorum_not_met"
+    assert replay["result"]["signature_quorum"]["counted"] == 1
 
 
 def test_grant_revocation_then_new_signer_fills_seat(services):

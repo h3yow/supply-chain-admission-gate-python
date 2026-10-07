@@ -1,7 +1,8 @@
 """Runnable local demo of the admission gate (no HTTP server needed).
 
 Walks one artifact through: policy publish -> unsigned deny -> sign -> pass ->
-signature expiry -> key rotation -> policy deny -> rollback -> replay. Prints
+signature expiry -> key rotation (old-key signatures stop counting) ->
+re-sign with the successor key -> policy deny -> rollback -> replay. Prints
 the input summary and decision basis at every step.
 
 Run:  uv run python demo.py
@@ -76,11 +77,29 @@ def main() -> None:
         CI, artifact_digest=ARTIFACT[0], artifact_type=ARTIFACT[1],
         request_id="demo-e3"))
 
-    # 4. Rotate key; old pre-rotation signature status explained.
+    # 4. Rotate key: every signature made with the old key stops counting.
     clock.advance(timedelta(days=-8))
     rotated = keys.rotate(ADMIN, "k1", comment="quarterly rotation")
-    print(f"\n5. rotated k1 -> {rotated['active_key']['key_id']}; "
-          f"pre-rotation signature stays valid")
+    new_key = rotated["active_key"]["key_id"]
+    print(f"\n5. rotated k1 -> {new_key}; "
+          f"old-key signatures no longer count")
+    show("5a. Evaluate after rotation (only old-key signature)",
+         admission.evaluate(CI, artifact_digest=ARTIFACT[0],
+                            artifact_type=ARTIFACT[1],
+                            request_id="demo-e-rotated"))
+
+    # 5. Re-sign with the rotation's successor key -> admission restored.
+    keys.grant_signer(ADMIN, new_key, "ci-bot")
+    ci_new = Caller(id="ci-bot", roles=("signer", "deployer"),
+                    key_grants=(new_key,))
+    signing.sign_artifact(ci_new, artifact_digest=ARTIFACT[0],
+                          artifact_type=ARTIFACT[1], key_id=new_key,
+                          request_id="demo-s1b",
+                          signature_ttl=timedelta(days=7))
+    show("5b. Evaluate after re-signing with successor key",
+         admission.evaluate(CI, artifact_digest=ARTIFACT[0],
+                            artifact_type=ARTIFACT[1],
+                            request_id="demo-e-resigned"))
 
     # 5. Policy v2 denies; then roll back to v1.
     policy.create_version(ADMIN, [PolicyRule(
@@ -106,12 +125,8 @@ def main() -> None:
         comment="require two distinct signers", request_id="demo-p3")
     artifact2 = ("sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
                  "container-image")
-    # ci-bot re-signs with the rotated (currently active) key; qa-bot signs
+    # ci-bot signs with the successor (currently active) key; qa-bot signs
     # with its own key. One signer alone is not enough.
-    new_key = rotated["active_key"]["key_id"]
-    keys.grant_signer(ADMIN, new_key, "ci-bot")
-    ci_new = Caller(id="ci-bot", roles=("signer", "deployer"),
-                    key_grants=(new_key,))
     keys.generate(ADMIN, key_id="k2", ttl=None)
     keys.grant_signer(ADMIN, "k2", "qa-bot")
     qa = Caller(id="qa-bot", roles=("signer",), key_grants=("k2",))

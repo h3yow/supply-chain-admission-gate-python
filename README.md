@@ -14,7 +14,7 @@
 
 ```bash
 uv sync                                  # 安装依赖
-uv run pytest -q                         # 运行全部 37 个测试（含多签/并发/跨进程/回退/恢复）
+uv run pytest -q                         # 运行全部 45 个测试（含多签/轮换/并发/跨进程/回退/恢复）
 uv run python demo.py                    # 不启服务，直接走一遍完整故事线
 uv run uvicorn main:app --reload         # 启动 HTTP 服务，默认 http://127.0.0.1:8000/docs
 ```
@@ -141,7 +141,7 @@ curl -s "$BASE/admission/replay/e2"
 | --- | --- | --- |
 | 生成 | `POST /admin/keys` | 随机密钥，可设 TTL（密钥本身过期时间） |
 | 授权 | `POST /admin/keys/{id}/grants` | 登记允许使用该密钥的调用方（服务端授权表） |
-| 轮换 | `POST /admin/keys/{id}/rotate` | 旧钥标记 `rotated_at/rotated_to` 并生成新活跃钥，旧记录不删除 |
+| 轮换 | `POST /admin/keys/{id}/rotate` | 旧钥标记 `rotated_at/rotated_to` 并生成新活跃钥，旧记录不删除；旧钥名下全部签名立即不再算数 |
 | 吊销 | `POST /admin/keys/{id}/revoke` | 立即失效，且对已有签名 **追溯生效** |
 | 撤销授权 | `DELETE /admin/keys/{id}/grants/{caller}` | 调用方失去该钥后，其既有签名变为未授权 |
 
@@ -156,14 +156,16 @@ curl -s "$BASE/admission/replay/e2"
 | `invalid` | HMAC 不匹配（载荷被篡改/密钥不符） | `signature_invalid` |
 | `unauthorized_caller` | 签名方不在该密钥的服务端授权表中 | `signature_unauthorized_caller` |
 | `revoked` | 签名密钥已被吊销（追溯） | `signature_key_revoked` |
-| `rotated` | 轮换发生 **之后** 仍用旧钥签的名 | `signature_key_rotated` |
+| `rotated` | 签名所用密钥已被轮换（无论签名登记在轮换前后） | `signature_key_rotated` |
 | `expired` | 超过签名 TTL | `signature_expired` |
 | `valid` | 全部检查通过 | — |
 
 关键边界：
 
-- **轮换前** 用旧钥签的名仍然有效（不视为 rotated，也不因轮换本身过期）；轮换后试图用旧钥
-  登记新签名会在事务内直接被拒（`409 key_rotated`），因此不会出现"轮换后旧钥新签名"。
+- 密钥一旦被轮换，**用它签过的所有签名立即不再算数**（状态 `rotated`，无论签名登记在
+  轮换之前还是之后）；轮换后试图用旧钥登记新签名会在事务内直接被拒（`409 key_rotated`），
+  因此旧钥名下不会再出现新签名。需要恢复准入时，用轮换产生的当前活跃密钥对同一制品
+  补签即可（见 §3.3）。
 - 吊销立即且追溯生效；授权被撤销同样会让既有签名变为 `unauthorized_caller`，重新授权后
   无需重签即可恢复。
 - 签名登记接口幂等：相同 `request_id` 重试返回同一记录（审计记 `signature_dedup_hit`）；
@@ -181,10 +183,10 @@ curl -s "$BASE/admission/replay/e2"
   历史签名全部保留可查（`GET /signatures/{digest}` 返回该制品的全部签名）。
 
 **门槛判定**：规则 `min_signatures: N` 要求至少 N 个 **不同签名方** 持有当前有效签名。
-计数的签名必须同时满足：签名本身状态为 `valid`（见 §3.2，含密钥未吊销、签名方授权仍有效）、
+计数的签名必须同时满足：签名本身状态为 `valid`（见 §3.2，含密钥未轮换/未吊销、签名方授权仍有效）、
 且其签名方与密钥都没有已经计过数——同一个人或同一把钥匙永远不能占两个席位。
 没算数的签名逐条列入结论的 `signature_quorum.rejected` 并给出原因
-（`expired` / `revoked` / `unauthorized_caller` / `duplicate_signer` / `duplicate_key` 等）。
+（`expired` / `rotated` / `revoked` / `unauthorized_caller` / `duplicate_signer` / `duplicate_key` 等）。
 
 **结论区分**：
 
@@ -196,17 +198,22 @@ curl -s "$BASE/admission/replay/e2"
 
 **密钥轮换/吊销与补签**：
 
-- 轮换本身不使轮换前的旧签名失效（§3.2 既有语义）；吊销密钥或撤销签名方授权则
-  **追溯生效**，相关签名立即不再算数，门槛可能因此跌破——结论变为
-  `signature_quorum_not_met` 并在 `rejected` 中说明；
-- 此时可用 **当前活跃密钥** 对同一制品补签（新密钥 = 新 slot，不与历史签名冲突），
-  把门槛重新凑齐；历史签名保留可查，已持久化的历史结论（按 `request_id` 重放）
+- 轮换、吊销、撤销签名方授权都会让相关旧签名 **立即不再算数**（追溯生效）：轮换后旧钥
+  名下的全部签名状态变为 `rotated`，门槛可能因此跌破——结论变为
+  `signature_quorum_not_met`，`signature_quorum` 中可见 `required`（要求几个）、
+  `counted`（实际算数几个）、`missing`（还缺几个），且每条不算数的签名都在 `rejected`
+  中带各自原因；只靠旧钥签名的制品不会被放行；
+- 此时可用 **当前活跃密钥**（轮换产生的新钥）对同一制品补签（新密钥 = 新 slot，
+  不与历史签名冲突），把门槛重新凑齐；同一签名方用同一把新钥的重试/重复/并发提交
+  仍只算一份。历史签名保留可查，已持久化的历史结论（按 `request_id` 重放）
   也永不被新事实改写，不会出现同一制品前后结论自相矛盾。
 
-**本地验证**：`uv run python demo.py` 的第 8–9 步演示 quorum=2 下"差一票"与"凑齐两人"
-两种结论；`uv run pytest tests/test_multisig.py -q` 运行多签专项用例（评估日志含输入摘要
-与 `quorum=counted/required` 计数，可用 `pytest -o log_cli=true` 直观看到）。旧版
-`state.json`（单签布局）在启动时自动从 `audit.log` 重建为多签布局，无需手工迁移。
+**本地验证**：`uv run python demo.py` 的第 5 步演示"轮换后旧钥签名不再计数、用新钥补签
+恢复放行"，第 8–9 步演示 quorum=2 下"差一票"与"凑齐两人"两种结论；
+`uv run pytest tests/test_multisig.py tests/test_key_rotation.py -q` 运行多签与轮换
+专项用例（评估日志含输入摘要与 `quorum=counted/required` 计数，可用
+`pytest -o log_cli=true` 直观看到）。旧版 `state.json`（单签布局）在启动时自动从
+`audit.log` 重建为多签布局，无需手工迁移。
 
 ---
 

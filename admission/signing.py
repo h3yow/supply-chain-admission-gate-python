@@ -13,8 +13,8 @@ Signature status (deterministic, given a point in time and the key registry):
 * ``unauthorized_caller`` -> signer identity was not granted that key
 * ``invalid``    -> HMAC does not verify (tampered payload or wrong secret)
 * ``revoked``    -> the signing key has been revoked
-* ``rotated``    -> signature was created with a key after it was rotated
-                    (a pre-rotation signature is only ``expired`` if old)
+* ``rotated``    -> the signing key has been rotated: every signature made
+                    with that key stops counting, whenever it was created
 * ``expired``    -> signature TTL elapsed
 * ``valid``      -> all checks pass
 
@@ -202,12 +202,12 @@ class SigningService:
             # Revocation is immediate and applies retroactively.
             return "revoked", DenyReason.SIGNATURE_KEY_REVOKED.value
 
-        if key.rotated_at is not None and parse_ts(record.signed_at) > parse_ts(key.rotated_at):
-            # Signed with the old key strictly *after* rotation happened.
-            # Equality cannot occur post-rotation: such a registration is
-            # rejected under the same serialised transaction that performed
-            # the rotation, so equal timestamps mean the signature committed
-            # first and remains a legitimate pre-rotation signature.
+        if key.rotated_at is not None:
+            # Rotation invalidates the key itself: every signature made with
+            # it — whenever it was created — stops counting. The signer must
+            # re-sign with the rotation's successor key to fill the seat
+            # again. (Registration with a rotated key is already rejected, so
+            # no new signatures can appear under it after rotation.)
             return "rotated", DenyReason.SIGNATURE_KEY_ROTATED.value
 
         if record.expires_at is not None and now >= parse_ts(record.expires_at):
