@@ -176,9 +176,12 @@ def test_rejected_signatures_carry_individual_reasons(services):
     assert rejected == {("alice", "expired"), ("bob", "unauthorized_caller")}
 
 
-def test_resign_with_active_key_after_revocation_restores_quorum(services):
-    """Key revoked -> old signature stops counting -> re-sign with a current
-    active key fills the seat again; history stays queryable."""
+def test_resign_with_active_key_after_rotation_restores_quorum(services):
+    """Key rotation -> every signature made with the old key stops counting
+    immediately (even pre-rotation ones) -> the artifact can no longer pass;
+    re-sign with the current active key fills the seat again. The old records
+    stay queryable, and the conclusion recorded while the quorum was broken
+    replays verbatim after the quorum is restored (no contradiction)."""
     _quorum_policy(services, 2)
     alice = _signer(services, "alice", "k-alice")
     bob = _signer(services, "bob", "k-bob")
@@ -191,10 +194,89 @@ def test_resign_with_active_key_after_revocation_restores_quorum(services):
                           signature_ttl=None)
     assert _evaluate(services, "e-before")["decision"] == "pass"
 
-    # Rotation alone keeps the pre-rotation signature valid (legacy语义).
-    rotated = keys.rotate(ADMIN, "k-alice")
+    # Rotation alone now breaks the quorum: Alice's pre-rotation signature
+    # no longer counts, with the individual reason visible in the ledger.
+    rotated = keys.rotate(ADMIN, "k-alice", comment="scheduled rotation")
     new_key = rotated["active_key"]["key_id"]
-    assert _evaluate(services, "e-rotated")["decision"] == "pass"
+    r = _evaluate(services, "e-rotated")
+    assert r["decision"] == "deny"
+    assert r["reason"] == "signature_quorum_not_met"
+    quorum = r["signature_quorum"]
+    assert quorum["required"] == 2
+    assert quorum["counted"] == 1
+    assert quorum["missing"] == 1
+    assert quorum["counted_signers"] == ["bob"]
+    rotated_entries = [x for x in quorum["rejected"]
+                       if x["status"] == "rotated"]
+    assert len(rotated_entries) == 1
+    assert rotated_entries[0]["signed_by"] == "alice"
+    assert rotated_entries[0]["key_id"] == "k-alice"
+    assert rotated_entries[0]["reason"] == "signature_key_rotated"
+
+    # An artifact carrying only old-key signatures cannot pass: rotate
+    # Bob's key too -> counted falls to zero while records still exist.
+    keys.rotate(ADMIN, "k-bob", comment="scheduled rotation")
+    r_none = _evaluate(services, "e-all-rotated")
+    assert r_none["decision"] == "deny"
+    assert r_none["reason"] == "signature_quorum_not_met"
+    assert r_none["signature_quorum"]["counted"] == 0
+    assert r_none["signature_quorum"]["missing"] == 2
+    assert {x["status"] for x in r_none["signature_quorum"]["rejected"]} \
+        == {"rotated"}
+
+    # Re-sign both artifacts' seats with the currently active keys.
+    bob_new_key = services["store"].state["keys"]["k-bob"]["rotated_to"]
+    keys.grant_signer(ADMIN, new_key, "alice")
+    keys.grant_signer(ADMIN, bob_new_key, "bob")
+    alice_new = Caller(id="alice", roles=("signer", "deployer"),
+                       key_grants=(new_key,))
+    bob_new = Caller(id="bob", roles=("signer", "deployer"),
+                     key_grants=(bob_new_key,))
+    signing.sign_artifact(alice_new, artifact_digest=DIGEST,
+                          artifact_type=TYPE, key_id=new_key,
+                          request_id="s-alice-new", signature_ttl=None)
+    signing.sign_artifact(bob_new, artifact_digest=DIGEST,
+                          artifact_type=TYPE, key_id=bob_new_key,
+                          request_id="s-bob-new", signature_ttl=None)
+    r2 = _evaluate(services, "e-resigned")
+    assert r2["decision"] == "pass"
+    assert r2["signature_quorum"]["counted"] == 2
+    assert r2["signature_quorum"]["missing"] == 0
+    assert sorted(r2["signature_quorum"]["counted_signers"]) == ["alice", "bob"]
+
+    # History: all four signatures remain registered and queryable; the two
+    # rotated records are listed alongside the active ones.
+    listed = signing.get_signatures(DIGEST)["signatures"]
+    assert len(listed) == 4
+    assert {s["key_id"] for s in listed} == {
+        "k-alice", "k-bob", new_key, bob_new_key}
+
+    # The conclusion recorded while the quorum was broken is not contradicted
+    # by the later re-signing: replay returns the stored deny verbatim.
+    replay = services["admission"].replay("e-rotated")
+    assert replay["result"]["decision"] == "deny"
+    assert replay["result"]["reason"] == "signature_quorum_not_met"
+    assert replay["result"]["signature_quorum"]["counted"] == 1
+    replay_none = services["admission"].replay("e-all-rotated")
+    assert replay_none["result"]["signature_quorum"]["counted"] == 0
+    # Re-evaluating with the same request_id also replays the stored result.
+    assert _evaluate(services, "e-rotated")["dedup"] is True
+
+
+def test_resign_with_active_key_after_revocation_restores_quorum(services):
+    """Revocation (existing behaviour, kept intact) also invalidates old
+    signatures retroactively; re-signing with an active key restores them."""
+    _quorum_policy(services, 2)
+    alice = _signer(services, "alice", "k-alice")
+    bob = _signer(services, "bob", "k-bob")
+    signing, keys = services["signing"], services["keys"]
+    signing.sign_artifact(alice, artifact_digest=DIGEST, artifact_type=TYPE,
+                          key_id="k-alice", request_id="s-alice",
+                          signature_ttl=None)
+    signing.sign_artifact(bob, artifact_digest=DIGEST, artifact_type=TYPE,
+                          key_id="k-bob", request_id="s-bob",
+                          signature_ttl=None)
+    assert _evaluate(services, "e-before")["decision"] == "pass"
 
     # Revoking the old key invalidates Alice's historical signature.
     keys.revoke(ADMIN, "k-alice", reason="suspected compromise")
@@ -205,23 +287,22 @@ def test_resign_with_active_key_after_revocation_restores_quorum(services):
     assert any(x["status"] == "revoked"
                for x in r["signature_quorum"]["rejected"])
 
-    # Re-sign with the current active key -> quorum restored.
-    keys.grant_signer(ADMIN, new_key, "alice")
+    # Re-sign with a fresh active key -> quorum restored.
+    keys.generate(ADMIN, key_id="k-alice-replacement", ttl=None)
+    keys.grant_signer(ADMIN, "k-alice-replacement", "alice")
     alice_new = Caller(id="alice", roles=("signer", "deployer"),
-                       key_grants=(new_key,))
+                       key_grants=("k-alice-replacement",))
     signing.sign_artifact(alice_new, artifact_digest=DIGEST,
-                          artifact_type=TYPE, key_id=new_key,
+                          artifact_type=TYPE, key_id="k-alice-replacement",
                           request_id="s-alice-new", signature_ttl=None)
     r2 = _evaluate(services, "e-resigned")
     assert r2["decision"] == "pass"
     assert r2["signature_quorum"]["counted"] == 2
 
-    # History: all three signatures remain registered and queryable.
+    # History keeps both Alice records; the deny still replays as recorded.
     listed = signing.get_signatures(DIGEST)["signatures"]
-    assert len(listed) == 3
-    assert {s["key_id"] for s in listed} == {"k-alice", "k-bob", new_key}
-
-    # The historical conclusion is not contradicted by the new facts.
+    assert {s["key_id"] for s in listed} == {
+        "k-alice", "k-bob", "k-alice-replacement"}
     replay = services["admission"].replay("e-revoked")
     assert replay["result"]["decision"] == "deny"
     assert replay["result"]["reason"] == "signature_quorum_not_met"

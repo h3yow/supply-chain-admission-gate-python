@@ -78,7 +78,10 @@ def test_expired_signature_is_denied_but_valid_before_ttl(services):
     assert r["signature_status"] == "expired"
 
 
-def test_rotation_pre_signature_valid_post_signature_rejected(services):
+def test_rotation_retires_old_key_signatures_retroactively(services):
+    """Rotation invalidates *every* signature made with the old key, even
+    signatures registered before the rotation happened. The record is kept,
+    and re-signing with the active replacement key is valid again."""
     keys, signing = services["keys"], services["signing"]
     keys.generate(ADMIN, key_id="k1", ttl=None)
     keys.grant_signer(ADMIN, "k1", "ci")
@@ -88,11 +91,20 @@ def test_rotation_pre_signature_valid_post_signature_rejected(services):
     signing.sign_artifact(ci, artifact_digest="sha256:old",
                           artifact_type="container-image", key_id="k1",
                           request_id="s-old", signature_ttl=None)
+    assert signing.validate_signature(
+        "sha256:old", "container-image")[1] == "valid"
+
     rotated = keys.rotate(ADMIN, "k1", comment="scheduled rotation")
     new_id = rotated["active_key"]["key_id"]
 
-    # Pre-rotation signature is still valid (signed_at < rotated_at).
-    assert signing.validate_signature("sha256:old", "container-image")[1] == "valid"
+    # The pre-rotation signature stops counting the moment the key rotates.
+    status, reason = signing.validate_signature(
+        "sha256:old", "container-image")[1:]
+    assert status == "rotated" and reason == "signature_key_rotated"
+
+    # The record is not deleted: history stays queryable.
+    listed = signing.get_signatures("sha256:old")["signatures"]
+    assert [s["key_id"] for s in listed] == ["k1"]
 
     # Signing with the old key after rotation is rejected at registration.
     with pytest.raises(AdmissionError) as exc:

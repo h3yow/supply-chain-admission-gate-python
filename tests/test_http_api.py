@@ -183,10 +183,38 @@ def test_multi_signature_quorum_over_http(client, actors):
 
 def test_key_rotation_over_http_invalidates_future_use(client, actors):
     _signed_image_world(client, actors)
+
+    # An artifact signed with k1 before rotation passes initially.
+    r = client.post("/signatures", headers=actors["ci"], json={
+        "artifact_digest": "sha256:pre", "artifact_type": "container-image",
+        "key_id": "k1", "request_id": "s-pre", "ttl_days": None})
+    assert r.status_code == 200 and r.json()["dedup"] is False
+    r = client.post("/admission/evaluate", headers=actors["ci"], json={
+        "artifact_digest": "sha256:pre", "artifact_type": "container-image",
+        "request_id": "e-pre-pass"})
+    assert r.json()["decision"] == "pass"
+
     r = client.post("/admin/keys/k1/rotate", headers=actors["admin"])
     assert r.status_code == 200
     new_id = r.json()["active_key"]["key_id"]
     assert r.json()["rotated_from"]["status"] == "rotated"
+
+    # The pre-rotation signature stops counting immediately: the already
+    # signed artifact is now denied with the specific rotated reason, while
+    # its record stays queryable.
+    r = client.post("/admission/evaluate", headers=actors["ci"], json={
+        "artifact_digest": "sha256:pre", "artifact_type": "container-image",
+        "request_id": "e-pre-rotated"})
+    body = r.json()
+    assert body["decision"] == "deny"
+    assert body["reason"] == "signature_key_rotated"
+    assert body["signature_status"] == "rotated"
+    listed = client.get("/signatures/sha256:pre").json()["signatures"]
+    assert [s["key_id"] for s in listed] == ["k1"]
+
+    # The earlier pass still replays verbatim (facts changed afterwards).
+    r = client.get("/admission/replay/e-pre-pass")
+    assert r.json()["result"]["decision"] == "pass"
 
     # signing with old key after rotation -> 409 key_rotated
     r = client.post("/signatures", headers=actors["ci"], json={
@@ -209,3 +237,16 @@ def test_key_rotation_over_http_invalidates_future_use(client, actors):
         "artifact_digest": "sha256:z", "artifact_type": "container-image",
         "key_id": new_id, "request_id": "s-new2", "ttl_days": None})
     assert r.status_code == 200
+
+    # Re-signing the pre-rotation artifact with the active key restores it;
+    # the old record remains listed next to the new one.
+    r = client.post("/signatures", headers=ci_headers, json={
+        "artifact_digest": "sha256:pre", "artifact_type": "container-image",
+        "key_id": new_id, "request_id": "s-pre-new", "ttl_days": None})
+    assert r.status_code == 200 and r.json()["dedup"] is False
+    r = client.post("/admission/evaluate", headers=actors["ci"], json={
+        "artifact_digest": "sha256:pre", "artifact_type": "container-image",
+        "request_id": "e-pre-resigned"})
+    assert r.json()["decision"] == "pass"
+    listed = client.get("/signatures/sha256:pre").json()["signatures"]
+    assert {s["key_id"] for s in listed} == {"k1", new_id}

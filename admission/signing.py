@@ -13,8 +13,13 @@ Signature status (deterministic, given a point in time and the key registry):
 * ``unauthorized_caller`` -> signer identity was not granted that key
 * ``invalid``    -> HMAC does not verify (tampered payload or wrong secret)
 * ``revoked``    -> the signing key has been revoked
-* ``rotated``    -> signature was created with a key after it was rotated
-                    (a pre-rotation signature is only ``expired`` if old)
+* ``rotated``    -> the signing key has been rotated. Rotation retires the
+                    old key for the admission gate immediately and retro-
+                    actively: every signature made with that key stops
+                    counting, including signatures made before rotation.
+                    The record itself is never deleted and stays queryable;
+                    re-signing with the current active key fills the seat
+                    again as an independent (signer, key) slot.
 * ``expired``    -> signature TTL elapsed
 * ``valid``      -> all checks pass
 
@@ -202,12 +207,14 @@ class SigningService:
             # Revocation is immediate and applies retroactively.
             return "revoked", DenyReason.SIGNATURE_KEY_REVOKED.value
 
-        if key.rotated_at is not None and parse_ts(record.signed_at) > parse_ts(key.rotated_at):
-            # Signed with the old key strictly *after* rotation happened.
-            # Equality cannot occur post-rotation: such a registration is
-            # rejected under the same serialised transaction that performed
-            # the rotation, so equal timestamps mean the signature committed
-            # first and remains a legitimate pre-rotation signature.
+        if key.rotated_at is not None:
+            # Rotation retires the old key immediately and retroactively:
+            # any signature made with it (before *or* after the rotation
+            # timestamp) stops counting. Fresh registrations with a rotated
+            # key are rejected inside the serialised rotation transaction,
+            # so the "after rotation" case cannot even be registered, but
+            # the rule is unconditional here on purpose — trust the key
+            # registry, not the signature's timestamp.
             return "rotated", DenyReason.SIGNATURE_KEY_ROTATED.value
 
         if record.expires_at is not None and now >= parse_ts(record.expires_at):

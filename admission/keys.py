@@ -2,8 +2,10 @@
 
 Only key-administrators (role ``key_admin``) may generate, rotate or revoke.
 Rotation marks the old key ``rotated_at``/``rotated_to`` and creates a new
-active key; it never deletes the old record, so signatures made before
-rotation remain explainable.
+active key; it never deletes the old record, so signatures made with the old
+key remain explainable and queryable — but they stop counting towards any
+admission quorum immediately and retroactively (see ``signing._classify``).
+Signers must re-sign with the new active key to make the artifact pass again.
 """
 from __future__ import annotations
 
